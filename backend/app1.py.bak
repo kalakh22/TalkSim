@@ -1,0 +1,166 @@
+import os
+import re
+import uuid
+import logging
+from datetime import datetime
+from flask import Flask, request, jsonify
+from google.cloud import texttospeech_v1beta1
+from flask_cors import CORS
+import asyncio
+
+app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Fetch bucket name and project ID from environment variables
+BUCKET_NAME = os.getenv("BUCKET_NAME", "tts-2way-longform")
+PROJECT_ID = os.getenv("PROJECT_ID", "diesel-bee-443408-t1")
+CREDENTIALS_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "./key.json")
+
+# Validate credentials file
+if not os.path.exists(CREDENTIALS_PATH):
+    raise FileNotFoundError(f"Credentials file not found at {CREDENTIALS_PATH}")
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = CREDENTIALS_PATH  # Ensure this is set
+
+# Enable CORS
+CORS(app)
+
+
+@app.route("/process-text", methods=["POST"])
+def process_text():
+    """
+    Process two-way conversation using Google Text-to-Speech Long Audio API
+    with MultiSpeakerMarkup and save the result in a GCS bucket.
+    """
+    try:
+        # Extract input text from the Flask request object
+        data = request.get_json()
+        text_input = data.get("text", None)
+
+        if not text_input:
+            raise ValueError("Text input is required.")
+
+        logging.info("Received text for two-way multispeaker synthesis.")
+
+        # Parse the dialogue input
+        parsed_turns = parse_dialogue(text_input)
+        logging.debug(f"Parsed turns: {parsed_turns}")
+
+        if not parsed_turns:
+            raise ValueError("No valid dialogue structure found in input text.")
+
+        # Generate a unique output path in the bucket
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = uuid.uuid4().hex[:8]  # Short UUID for uniqueness
+        output_gcs_uri = f"gs://{BUCKET_NAME}/tts_outputs/{timestamp}_{unique_id}.wav"
+        logging.info(f"Generated unique GCS path: {output_gcs_uri}")
+
+        # Run the async synthesis process in an event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            result = loop.run_until_complete(synthesize_audio(parsed_turns, output_gcs_uri))
+        except Exception as asyncio_error:
+            logging.error(f"Asyncio Error: {asyncio_error}")
+            raise
+
+        return jsonify({"message": "Synthesis complete", "output_gcs_uri": result}), 200
+
+    except Exception as e:
+        logging.error(f"Error during long-form synthesis: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+async def synthesize_audio(parsed_turns, output_gcs_uri):
+    """
+    Asynchronous function to perform long-form synthesis with Google Cloud TTS.
+    """
+    try:
+        # Initialize the Text-to-Speech Long Audio Client
+        tts_client = texttospeech_v1beta1.TextToSpeechLongAudioSynthesizeAsyncClient()
+
+        # Configure the synthesis input with MultiSpeakerMarkup
+        multi_speaker_markup = texttospeech_v1beta1.SynthesisInput(
+            multi_speaker_markup=texttospeech_v1beta1.MultiSpeakerMarkup(
+                turns=[
+                    texttospeech_v1beta1.MultiSpeakerMarkup.Turn(
+                        speaker=turn["speaker"], text=turn["text"]
+                    )
+                    for turn in parsed_turns
+                ]
+            )
+        )
+
+        # Configure the voice parameters
+        voice_params = texttospeech_v1beta1.VoiceSelectionParams(
+            language_code="en-US",
+            name="en-US-Neural2-D",  # Studio-quality voice
+        )
+
+        # Configure the audio output with LINEAR16
+        audio_config = texttospeech_v1beta1.AudioConfig(
+            audio_encoding=texttospeech_v1beta1.AudioEncoding.LINEAR16
+        )
+
+        # Specify the parent field
+        parent = f"projects/{PROJECT_ID}/locations/global"
+
+        # Create the synthesis request
+        synthesis_request = texttospeech_v1beta1.SynthesizeLongAudioRequest(
+            parent=parent,
+            input=multi_speaker_markup,
+            audio_config=audio_config,
+            voice=voice_params,
+            output_gcs_uri=output_gcs_uri,  # Unique output path
+        )
+
+        # Optional logging of request payload
+        logging.debug(f"Synthesis Request Payload: {synthesis_request}")
+
+        # Send the request
+        operation = await tts_client.synthesize_long_audio(request=synthesis_request)
+        logging.info("Long-form synthesis request sent. Waiting for operation to complete...")
+
+        # Await the operation's result
+        await operation.result(timeout=600)  # Wait up to 10 minutes
+        logging.info(f"Audio successfully synthesized and saved to: {output_gcs_uri}")
+        return output_gcs_uri
+
+    except Exception as e:
+        logging.error(f"Error during long-form synthesis: {e}")
+        raise
+
+
+def parse_dialogue(text):
+    """
+    Parses the input text into a structured format compatible with MultiSpeakerMarkup.
+    The input is expected to follow the format: 'Speaker N: text'.
+    """
+    turns = []
+    for line in text.strip().split("\n"):
+        match = re.match(r"(Speaker \d+):\s*(.*)", line, re.IGNORECASE)
+        if match:
+            speaker_label, utterance = match.groups()
+            speaker_code = map_speaker_label_to_code(speaker_label)
+            if speaker_code and utterance:
+                turns.append({"speaker": speaker_code, "text": utterance})
+        else:
+            logging.warning(f"Unrecognized line format: {line}")
+    if not turns:
+        raise ValueError("No valid dialogue structure found in input text.")
+    logging.debug(f"Parsed turns: {turns}")
+    return turns
+
+
+def map_speaker_label_to_code(speaker_label):
+    """
+    Maps speaker labels to corresponding codes for Google TTS.
+    """
+    speaker_map = {"Speaker 1": "R", "Speaker 2": "S"}
+    return speaker_map.get(speaker_label, None)
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
