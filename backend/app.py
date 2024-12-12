@@ -12,7 +12,7 @@ from io import StringIO
 
 app = Flask(__name__)
 
-MAX_CHARS = 5000
+MAX_CHARS = 2000  # Maximum characters per chunk
 OUTPUT_DIR = "./output"
 RETRY_LIMIT = 3  # Number of retries for failed chunks
 
@@ -156,20 +156,20 @@ def synthesize_chunk_with_retry(tts_client, chunk, chunk_index):
 
 def retry_chunk(chunk):
     """
-    Modify the chunk by progressively reducing complexity.
-    If still too long, split into individual turns.
+    Retry mechanism for chunks that fail due to size or complexity. Splits long turns into smaller sub-turns.
     """
-    # Step 1: Remove punctuations
+    refined_chunk = []
     for turn in chunk:
-        turn["text"] = re.sub(r"[^\w\s]", "", turn["text"])
-    logging.info(f"Retrying chunk with reduced punctuations: {chunk}")
+        if len(turn["text"]) + len(turn["speaker"]) + 2 > MAX_CHARS:
+            # Split the long turn into smaller sub-turns
+            sub_turns = split_large_turn(turn["text"], MAX_CHARS - len(turn["speaker"]) - 2)
+            refined_chunk.extend([{"speaker": turn["speaker"], "text": sub_turn} for sub_turn in sub_turns])
+        else:
+            refined_chunk.append(turn)
 
-    # Step 2: If still too large, split into individual turns
-    if len(chunk) > 1:
-        logging.warning("Splitting chunk into individual turns due to repeated failures.")
-        return [[turn] for turn in chunk]
+    return refined_chunk
 
-    return chunk
+
 
 def log_chunk_details(chunks):
     for i, chunk in enumerate(chunks):
@@ -190,6 +190,10 @@ def synthesize_chunk(tts_client, chunk, chunk_index):
     Synthesizes a chunk of text using MultiSpeakerMarkup and saves it to a temporary file.
     """
     logging.info(f"Processing chunk {chunk_index + 1}...")
+
+    # Validate chunk structure
+    if not all("speaker" in turn and "text" in turn for turn in chunk):
+        raise ValueError(f"Invalid chunk structure: {chunk}")
 
     # Construct the MultiSpeakerMarkup for the chunk
     try:
@@ -232,6 +236,7 @@ def synthesize_chunk(tts_client, chunk, chunk_index):
     return temp_file
 
 
+
 def concatenate_audio(audio_files):
     clips = [AudioFileClip(file) for file in audio_files]
     concatenated_clip = concatenate_audioclips(clips)
@@ -242,28 +247,45 @@ def concatenate_audio(audio_files):
 def parse_dialogue(text):
     """
     Parses the input text into a structured format compatible with MultiSpeakerMarkup.
-    The input is expected to follow the format: 'Speaker N: text'.
+    Lines without 'Speaker X:' will be appended to the previous speaker's text.
     """
     turns = []
+    current_speaker = None
+    current_text = []
+
     for line in text.strip().split("\n"):
         match = re.match(r"(Speaker \d+):\s*(.*)", line, re.IGNORECASE)
         if match:
-            speaker_label, utterance = match.groups()
-            speaker_code = map_speaker_label_to_code(speaker_label)
-            if speaker_code and utterance:
-                turns.append({"speaker": speaker_code, "text": utterance})
+            # Save the previous speaker's turn if present
+            if current_speaker and current_text:
+                turns.append({"speaker": map_speaker_label_to_code(current_speaker), "text": " ".join(current_text)})
+                current_text = []
+
+            # Start a new speaker's turn
+            current_speaker, text = match.groups()
+            current_text.append(text)
         else:
-            logging.warning(f"Unrecognized line format: {line}")
+            # Append text to the current speaker
+            if current_speaker:
+                current_text.append(line.strip())
+
+    # Add the final speaker's turn
+    if current_speaker and current_text:
+        turns.append({"speaker": map_speaker_label_to_code(current_speaker), "text": " ".join(current_text)})
+
     if not turns:
         raise ValueError("No valid dialogue structure found in input text.")
+
     logging.debug(f"Parsed turns: {turns}")
     return turns
 
 
+
+
 def split_into_chunks(parsed_turns):
     """
-    Splits parsed dialogue into chunks of less than MAX_CHARS.
-    Ensures chunks are generated properly even for large single turns.
+    Splits parsed dialogue into chunks, ensuring no single turn exceeds the character limit
+    and that each chunk fits within the max character limit.
     """
     chunks = []
     current_chunk = []
@@ -272,16 +294,21 @@ def split_into_chunks(parsed_turns):
     for turn in parsed_turns:
         turn_length = len(turn["text"]) + len(turn["speaker"]) + 2  # Include ": "
 
-        # Handle cases where a single turn exceeds MAX_CHARS
+        # If the turn exceeds the max length, split it into smaller sub-turns
         if turn_length > MAX_CHARS:
-            logging.warning(f"Turn exceeds MAX_CHARS: {turn}")
-            # Split the turn into smaller chunks
-            split_text = split_large_turn(turn["text"], MAX_CHARS - len(turn["speaker"]) - 2)
-            for part in split_text:
-                chunks.append([{"speaker": turn["speaker"], "text": part}])
+            sub_turns = split_large_turn(turn["text"], MAX_CHARS - len(turn["speaker"]) - 2)
+            for sub_turn in sub_turns:
+                new_turn = {"speaker": turn["speaker"], "text": sub_turn}
+                if current_length + len(sub_turn) + len(turn["speaker"]) + 2 <= MAX_CHARS:
+                    current_chunk.append(new_turn)
+                    current_length += len(sub_turn) + len(turn["speaker"]) + 2
+                else:
+                    chunks.append(current_chunk)
+                    current_chunk = [new_turn]
+                    current_length = len(sub_turn) + len(turn["speaker"]) + 2
             continue
 
-        # Add turn to the current chunk if it fits
+        # Add the turn to the current chunk if it fits
         if current_length + turn_length <= MAX_CHARS:
             current_chunk.append(turn)
             current_length += turn_length
@@ -295,11 +322,11 @@ def split_into_chunks(parsed_turns):
     if current_chunk:
         chunks.append(current_chunk)
 
-    # Additional Split: Ensure chunks don't exceed TTS API byte limit
-    validated_chunks = []
-    for chunk in chunks:
-        validated_chunks.extend(split_large_chunk_by_bytes(chunk))
-    return validated_chunks
+    return chunks
+
+
+
+
 
 def split_large_chunk_by_bytes(chunk, max_turns=3):
     """
@@ -333,23 +360,28 @@ def split_large_chunk_by_bytes(chunk, max_turns=3):
 
 def split_large_turn(text, max_length):
     """
-    Splits a single large turn into smaller chunks that fit within max_length.
+    Splits a single long turn into smaller sub-turns that fit within the max_length limit.
     """
     words = text.split()
-    chunks = []
-    current_chunk = []
+    sub_turns = []
+    current_sub_turn = []
 
     for word in words:
-        if len(" ".join(current_chunk + [word])) <= max_length:
-            current_chunk.append(word)
+        # Add word to current sub-turn if it fits
+        if len(" ".join(current_sub_turn + [word])) <= max_length:
+            current_sub_turn.append(word)
         else:
-            chunks.append(" ".join(current_chunk))
-            current_chunk = [word]
+            # Save the current sub-turn and start a new one
+            sub_turns.append(" ".join(current_sub_turn))
+            current_sub_turn = [word]
 
-    if current_chunk:
-        chunks.append(" ".join(current_chunk))
+    # Add the last sub-turn
+    if current_sub_turn:
+        sub_turns.append(" ".join(current_sub_turn))
 
-    return chunks
+    return sub_turns
+
+
 
 
 def map_speaker_label_to_code(speaker_label):
